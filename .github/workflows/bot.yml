@@ -2,7 +2,6 @@ name: MAX Z.AI Bot
 
 on:
   schedule:
-    # Запуск каждые 3 минуты
     - cron: '*/3 * * * *'
   workflow_dispatch:
 
@@ -40,8 +39,8 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          # Используем -A чтобы добавить изменения, игнорируя ошибку, если файла раньше не было
-          git add -A state.json 2>/dev/null || true
-          # Коммитим только если есть изменения в индексе
+          # Добавляем все изменения, игнорируя ошибки, если файлов еще нет
+          git add -A 2>/dev/null || true
+          # Коммитим только если реально есть что коммитить
           git diff --staged --quiet || git commit -m "chore: update bot state marker"
           git push
