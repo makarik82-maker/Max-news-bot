@@ -2,7 +2,7 @@ name: MAX GigaChat Bot
 
 on:
   schedule:
-    - cron: '*/2 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -36,7 +36,8 @@ jobs:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           MAX_API_BASE: https://platform-api2.max.ru
           GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-          FORCE_CHAT_ID: -71777603207295
+          # НОВЫЙ ЧАТ ДЛЯ АНАЛИЗА
+          FORCE_CHAT_ID: -72947408034387
         run: python bot.py
 
       - name: Commit and push state changes
