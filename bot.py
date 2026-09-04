@@ -317,8 +317,8 @@ def force_read_and_respond(chat_id: str, state: dict):
     print(f"📋 Уже обработано сообщений: {len(processed_ids)}")
     print(f"⏰ Последний общий анализ: {time.strftime('%H:%M:%S', time.localtime(last_analysis_time)) if last_analysis_time else 'никогда'}")
 
-    # Получаем последние 60 сообщений
-    r = max_get("/messages", {"chat_id": chat_id, "count": 60})
+    # Получаем последние 15 сообщений
+    r = max_get("/messages", {"chat_id": chat_id, "count": 15})
     print(f"📡 GET /messages → статус {r.status_code}")
 
     if r.status_code != 200:
