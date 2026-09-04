@@ -23,7 +23,6 @@ MAX_TEXT_LEN = 3900
 # Работа с состоянием (маркером сообщений)
 # ==========================================
 def load_state():
-    """Загружает последний обработанный ID сообщения из файла."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -34,7 +33,6 @@ def load_state():
 
 
 def save_state(state):
-    """Сохраняет обновленный ID сообщения в файл."""
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -43,108 +41,70 @@ def save_state(state):
 # Разбор сообщений из MAX
 # ==========================================
 def get_text(message: dict) -> str:
-    """Извлекает текст сообщения."""
     body = message.get("body") or {}
     return (body.get("text") or message.get("text") or "").strip()
 
 
 def get_target(message: dict) -> dict | None:
-    """Определяет, куда отправлять ответ (chat_id или user_id)."""
     recipient = message.get("recipient") or {}
-
     chat_id = recipient.get("chat_id") or message.get("chat_id")
     user_id = recipient.get("user_id") or message.get("user_id")
-
-    if chat_id:
-        return {"chat_id": chat_id}
-    if user_id:
-        return {"user_id": user_id}
-
+    if chat_id: return {"chat_id": chat_id}
+    if user_id: return {"user_id": user_id}
     return None
 
 
 def is_bot_message(message: dict) -> bool:
-    """Проверяет, отправлено ли сообщение самим ботом (чтобы избежать циклов)."""
     sender = message.get("sender") or {}
     return bool(sender.get("is_bot") or sender.get("type") == "bot")
 
 
 # ==========================================
-# Интеграция с Z.AI (OpenAI-совместимый API)
+# Интеграция с Z.AI
 # ==========================================
 def ask_zai(prompt: str) -> str:
-    """Отправляет запрос в Z.AI и возвращает текстовый ответ."""
     url = f"{ZAI_BASE_URL.rstrip('/')}/chat/completions"
-
     headers = {
         "Authorization": f"Bearer {ZAI_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "model": ZAI_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": "Ты полезный и вежливый ассистент в чате. Отвечай кратко, по делу и на том языке, на котором к тебе обратились."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": "Ты полезный и вежливый ассистент в чате. Отвечай кратко, по делу и на том языке, на котором к тебе обратились."},
+            {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
     }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=60,
-    )
-
+    response = requests.post(url, headers=headers, json=payload, timeout=60)
     if response.status_code != 200:
-        print("Ошибка Z.AI API:")
-        print(f"Status Code: {response.status_code}")
-        print(f"Response: {response.text[:1000]}")
+        print(f"Ошибка Z.AI API: {response.status_code} - {response.text[:500]}")
         response.raise_for_status()
-
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    return response.json()["choices"][0]["message"]["content"].strip()
 
 
 # ==========================================
-# Отправка сообщений в MAX (С ПОДДЕРЖКОЙ Bearer TOKEN)
+# Отправка сообщений в MAX (БЕЗ Bearer!)
 # ==========================================
 def send_message(target: dict, text: str):
-    """Отправляет сгенерированный ответ обратно в чат MAX через Authorization header."""
     url = f"{API_BASE}/messages"
-
-    # НОВАЯ АВТОРИЗАЦИЯ ЧЕРЕЗ HEADER
+    
+    # ВАЖНО: MAX требует просто токен, без слова Bearer
     headers = {
-        "Authorization": f"Bearer {BOT_TOKEN}",
+        "Authorization": BOT_TOKEN,
         "Content-Type": "application/json"
-    }
-
-    # Параметры URL теперь содержат только chat_id/user_id
-    params = target.copy() if target else {}
-
-    payload = {
-        "text": text[:MAX_TEXT_LEN],
     }
 
     try:
         response = requests.post(
             url,
-            params=params,
-            json=payload,
+            params=target,
+            json={"text": text[:MAX_TEXT_LEN]},
             headers=headers,
             timeout=30,
         )
         if response.status_code != 200:
             print(f"Ошибка отправки в MAX ({response.status_code}): {response.text[:500]}")
-        else:
-            print("Сообщение успешно отправлено.")
     except Exception as e:
         print(f"Ошибка отправки в MAX: {e}")
 
@@ -153,33 +113,23 @@ def send_message(target: dict, text: str):
 # Основной процесс (запуск GitHub Actions)
 # ==========================================
 def process_updates():
-    """Главная функция: получает апдейты, обрабатывает их и сохраняет состояние."""
-    if not BOT_TOKEN:
-        print("Критическая ошибка: не задан MAX_BOT_TOKEN в переменных окружения.")
-        return
-
-    if not ZAI_API_KEY:
-        print("Критическая ошибка: не задан ZAI_API_KEY в переменных окружения.")
+    if not BOT_TOKEN or not ZAI_API_KEY:
+        print("Критическая ошибка: не заданы токены.")
         return
 
     state = load_state()
     marker = state.get("marker", 0)
-
     print(f"Запуск обработки. Текущий marker: {marker}")
 
     try:
-        # НОВАЯ АВТОРИЗАЦИЯ ЧЕРЕЗ HEADER
+        # ВАЖНО: MAX требует просто токен, без слова Bearer
         headers = {
-            "Authorization": f"Bearer {BOT_TOKEN}"
+            "Authorization": BOT_TOKEN
         }
         
-        # 1. Запрашиваем новые сообщения из MAX
         response = requests.get(
             f"{API_BASE}/updates",
-            params={
-                "marker": marker,
-                "limit": 100,
-            },
+            params={"marker": marker, "limit": 100},
             headers=headers,
             timeout=30,
         )
@@ -198,15 +148,12 @@ def process_updates():
 
         print(f"Получено обновлений: {len(updates)}")
 
-        # 2. Обрабатываем каждое сообщение
         for update in updates:
             update_id = update.get("update_id") or update.get("id")
             message = update.get("message") or update.get("data") or {}
 
-            # Пропускаем пустые события или сообщения от самого бота
             if not message or is_bot_message(message):
-                if update_id:
-                    marker = max(marker, int(update_id) + 1)
+                if update_id: marker = max(marker, int(update_id) + 1)
                 continue
 
             text = get_text(message)
@@ -214,27 +161,19 @@ def process_updates():
 
             if text and target:
                 print(f"Обработка запроса: {text[:50]}...")
-
                 try:
-                    # Запрос к ИИ
                     answer = ask_zai(text)
-                    # Отправка ответа в чат
                     send_message(target, answer)
                 except Exception as e:
                     print(f"Ошибка при генерации или отправке: {e}")
-                    send_message(
-                        target,
-                        "⚠️ Извините, произошла ошибка при генерации ответа."
-                    )
+                    send_message(target, "⚠️ Извините, произошла ошибка при генерации ответа.")
 
-            # Сдвигаем маркер
             if update_id:
                 marker = max(marker, int(update_id) + 1)
 
     except Exception as e:
         print(f"Критическая ошибка при получении апдейтов: {e}")
 
-    # 3. Сохраняем новый маркер в файл, чтобы не обработать эти сообщения повторно
     state["marker"] = marker
     save_state(state)
     print(f"Обработка завершена. Новый marker сохранен: {marker}")
