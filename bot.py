@@ -1,10 +1,9 @@
 import os
 import json
 import time
+import uuid
 import requests
 import urllib3
-from gigachat import GigaChat
-from gigachat.models import Chat, Messages, Roles  # <-- ДОБАВЛЕНО: импорты моделей GigaChat
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -15,12 +14,24 @@ BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru")
 
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
-GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")
 
 FORCE_CHAT_ID = os.getenv("FORCE_CHAT_ID")
 STATE_FILE = "state.json"
 MAX_TEXT_LEN = 4000
+
+# Настройки GigaChat (как в вашем рабочем коде)
+OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+GIGACHAT_API_URL = "https://api.giga.chat/v1"
+VERIFY_SSL = False
+GIGACHAT_MODEL = "GigaChat-3-Ultra"
+
+SYSTEM_PERSONA = (
+    "Ты — дружелюбный собеседник, отвечаешь на русском языке. "
+    "Отвечай кратко (1-3 предложения), по делу и вежливо."
+)
+
+# Кэш OAuth-токена (токен действует ~30 минут)
+_token_cache = {"token": None, "expires_at": 0}
 
 
 # ==========================================
@@ -45,6 +56,97 @@ def max_post(path, params, body):
 
 
 # ==========================================
+# GigaChat: получение OAuth-токена
+# ==========================================
+def get_gigachat_token() -> str:
+    """Получает OAuth-токен GigaChat через Basic Auth (как в вашем рабочем коде)."""
+    # Если есть валидный кэшированный токен — используем его
+    now = time.time()
+    if _token_cache["token"] and _token_cache["expires_at"] > now + 60:
+        return _token_cache["token"]
+
+    resp = requests.post(
+        OAUTH_URL,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+            "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
+        },
+        data={"scope": "GIGACHAT_API_PERS"},
+        verify=VERIFY_SSL,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    token = data["access_token"]
+    # Токен обычно действует ~30 минут, кэшируем с запасом
+    expires_in = data.get("expires_in", 1800)
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = now + expires_in
+
+    print(f"🔑 Получен новый GigaChat OAuth-токен (действует {expires_in}с)")
+    return token
+
+
+# ==========================================
+# GigaChat: генерация текста через REST API
+# ==========================================
+def ask_gigachat(prompt: str, history: list = None) -> str:
+    """Отправляет запрос в GigaChat через REST API (OpenAI-совместимый)."""
+    token = get_gigachat_token()
+
+    messages = [{"role": "system", "content": SYSTEM_PERSONA}]
+    if history:
+        messages.extend(history[-20:])  # Берём последние 20 сообщений контекста
+    messages.append({"role": "user", "content": prompt})
+
+    resp = requests.post(
+        f"{GIGACHAT_API_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": GIGACHAT_MODEL,
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 800,
+        },
+        verify=VERIFY_SSL,
+        timeout=60,
+    )
+
+    if resp.status_code == 401:
+        # Токен протух, сбрасываем кэш и пробуем ещё раз
+        print("⚠️ GigaChat токен протух, получаю новый...")
+        _token_cache["token"] = None
+        _token_cache["expires_at"] = 0
+        token = get_gigachat_token()
+        resp = requests.post(
+            f"{GIGACHAT_API_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GIGACHAT_MODEL,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 800,
+            },
+            verify=VERIFY_SSL,
+            timeout=60,
+        )
+
+    resp.raise_for_status()
+    answer = resp.json()["choices"][0]["message"]["content"].strip()
+    print(f"✅ GigaChat ответила (модель: {GIGACHAT_MODEL})")
+    return answer
+
+
+# ==========================================
 # Работа с состоянием
 # ==========================================
 def load_state():
@@ -54,12 +156,16 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"marker": 0, "replied_messages": []}
+    return {"marker": 0, "replied_messages": [], "history": {}}
 
 
 def save_state(state):
     if "replied_messages" in state:
         state["replied_messages"] = state["replied_messages"][-200:]
+    # Ограничиваем историю для каждого чата
+    if "history" in state:
+        for chat_id in list(state["history"].keys()):
+            state["history"][chat_id] = state["history"][chat_id][-20:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -91,61 +197,6 @@ def get_bot_id():
     except Exception as e:
         print(f"Не удалось получить ID бота: {e}")
     return None
-
-
-# ==========================================
-# GigaChat (с автоматическим подбором модели)
-# ==========================================
-def ask_gigachat(prompt: str) -> str:
-    models_to_try = ["GigaChat", "GigaChat-Pro", "GigaChat-Max", "GigaChat-Lite"]
-
-    system_prompt = (
-        "Ты полезный и вежливый ассистент в чате. "
-        "Отвечай кратко, по делу и на том языке, на котором к тебе обратились."
-    )
-
-    if GIGACHAT_MODEL and GIGACHAT_MODEL not in models_to_try:
-        models_to_try.insert(0, GIGACHAT_MODEL)
-
-    # ИСПРАВЛЕНО: формируем правильный объект Chat для SDK GigaChat
-    payload = Chat(
-        messages=[
-            Messages(role=Roles.SYSTEM, content=system_prompt),
-            Messages(role=Roles.USER, content=prompt)
-        ]
-    )
-
-    for model in models_to_try:
-        try:
-            with GigaChat(
-                credentials=GIGACHAT_CREDENTIALS,
-                scope=GIGACHAT_SCOPE,
-                model=model,
-                verify_ssl_certs=False,
-            ) as client:
-                response = client.chat(payload)
-                answer = response.choices[0].message.content.strip()
-                print(f"✅ GigaChat ответила через модель: {model}")
-                return answer
-
-        except Exception as e:
-            err_str = str(e)
-            print(f"⚠️ Ошибка с моделью {model}: {err_str[:200]}")
-
-            if "model" in err_str.lower() or "not found" in err_str.lower() or "does not exist" in err_str.lower():
-                print("Пробую следующую модель...")
-                continue
-            elif "auth" in err_str.lower() or "401" in err_str:
-                print("❌ Ошибка авторизации GigaChat. Проверьте GIGACHAT_CREDENTIALS.")
-                break
-            elif "timeout" in err_str.lower() or "overloaded" in err_str.lower():
-                print("⏱️ Таймаут или перегруз, пробую снова через 2 сек...")
-                time.sleep(2)
-                continue
-            else:
-                continue
-
-    raise Exception("Ни одна из моделей GigaChat не сработала")
 
 
 # ==========================================
@@ -212,13 +263,24 @@ def force_read_channel(chat_id: str, state: dict):
     to_reply = valid[:3]
     print(f"💬 Отвечаю на {len(to_reply)} сообщений")
 
+    # Получаем историю диалога для этого чата
+    chat_history_key = str(chat_id)
+    history = state.setdefault("history", {}).get(chat_history_key, [])
+
     for ts, msg_id, text in reversed(to_reply):
         print(f"Обработка: [{msg_id}] {text[:60]}...")
         try:
-            answer = ask_gigachat(text)
+            answer = ask_gigachat(text, history=history)
             ok = send_message(chat_id, answer, reply_to=msg_id)
             if ok:
                 state["replied_messages"].append(msg_id)
+                # Добавляем в историю диалога
+                history.append({"role": "user", "content": text})
+                history.append({"role": "assistant", "content": answer})
+                # Ограничиваем историю 20 последними репликами (10 пар)
+                if len(history) > 20:
+                    del history[:-20]
+                state["history"][chat_history_key] = history
                 save_state(state)
         except Exception as e:
             print(f"Ошибка при генерации/отправке: {e}")
@@ -258,9 +320,16 @@ def process_updates(state: dict):
 
         if text and target:
             print(f"Обработка запроса: {text[:60]}...")
+            chat_history_key = str(target)
+            history = state.setdefault("history", {}).get(chat_history_key, [])
             try:
-                answer = ask_gigachat(text)
+                answer = ask_gigachat(text, history=history)
                 send_message(target, answer)
+                history.append({"role": "user", "content": text})
+                history.append({"role": "assistant", "content": answer})
+                if len(history) > 20:
+                    del history[:-20]
+                state["history"][chat_history_key] = history
             except Exception as e:
                 print(f"Ошибка: {e}")
 
