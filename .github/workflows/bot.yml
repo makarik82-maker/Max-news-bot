@@ -34,7 +34,7 @@ jobs:
         env:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-          ZAI_MODEL: glm-4.7-flash
+          ZAI_MODEL: glm-4-flash
           ZAI_BASE_URL: https://api.z.ai/api/paas/v4
         run: python bot.py
 
