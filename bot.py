@@ -2,6 +2,7 @@ import os
 import json
 import time
 import uuid
+import re
 import requests
 import urllib3
 
@@ -19,18 +20,32 @@ FORCE_CHAT_ID = os.getenv("FORCE_CHAT_ID")
 STATE_FILE = "state.json"
 MAX_TEXT_LEN = 4000
 
-# Настройки GigaChat (как в вашем рабочем коде)
+# Настройки GigaChat
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_API_URL = "https://api.giga.chat/v1"
 VERIFY_SSL = False
 GIGACHAT_MODEL = "GigaChat-3-Ultra"
 
-SYSTEM_PERSONA = (
-    "Ты — дружелюбный собеседник, отвечаешь на русском языке. "
-    "Отвечай кратко (1-3 предложения), по делу и вежливо."
-)
+ANALYSIS_SYSTEM_PROMPT = """Ты — умный ассистент, который участвует в групповом чате.
+Тебе дают последние сообщения из чата. Твоя задача:
 
-# Кэш OAuth-токена (токен действует ~30 минут)
+1. Проанализировать тематику беседы
+2. Определить, есть ли в последних сообщениях вопрос, на который ты можешь ответить
+3. Если есть конкретный вопрос — дай краткий и полезный ответ на него
+4. Если вопросы неясные или это просто болтовня — дай общий комментарий к дискуссии
+5. Если участвовать нечего — верни пустой ответ
+
+ВАЖНО: Отвечай строго в формате JSON:
+{
+  "should_reply": true или false,
+  "message_id": "ID сообщения на которое отвечаешь (если есть конкретный вопрос) или null",
+  "answer": "Твой ответ или комментарий"
+}
+
+Если не нужно отвечать вообще, верни: {"should_reply": false, "message_id": null, "answer": ""}
+"""
+
+# Кэш OAuth-токена
 _token_cache = {"token": None, "expires_at": 0}
 
 
@@ -59,8 +74,6 @@ def max_post(path, params, body):
 # GigaChat: получение OAuth-токена
 # ==========================================
 def get_gigachat_token() -> str:
-    """Получает OAuth-токен GigaChat через Basic Auth (как в вашем рабочем коде)."""
-    # Если есть валидный кэшированный токен — используем его
     now = time.time()
     if _token_cache["token"] and _token_cache["expires_at"] > now + 60:
         return _token_cache["token"]
@@ -81,7 +94,6 @@ def get_gigachat_token() -> str:
     data = resp.json()
 
     token = data["access_token"]
-    # Токен обычно действует ~30 минут, кэшируем с запасом
     expires_in = data.get("expires_in", 1800)
     _token_cache["token"] = token
     _token_cache["expires_at"] = now + expires_in
@@ -91,59 +103,83 @@ def get_gigachat_token() -> str:
 
 
 # ==========================================
-# GigaChat: генерация текста через REST API
+# GigaChat: анализ беседы через REST API
 # ==========================================
-def ask_gigachat(prompt: str, history: list = None) -> str:
-    """Отправляет запрос в GigaChat через REST API (OpenAI-совместимый)."""
+def ask_gigachat_analysis(messages_for_analysis: list) -> dict:
+    """
+    Отправляет список сообщений в GigaChat и получает JSON-ответ.
+    Возвращает словарь: {"should_reply": bool, "message_id": str|None, "answer": str}
+    """
     token = get_gigachat_token()
 
-    messages = [{"role": "system", "content": SYSTEM_PERSONA}]
-    if history:
-        messages.extend(history[-20:])  # Берём последние 20 сообщений контекста
-    messages.append({"role": "user", "content": prompt})
+    # Формируем промпт с историей сообщений
+    history_text = ""
+    for msg in messages_for_analysis:
+        author = msg.get("author_name", "Неизвестный")
+        text = msg.get("text", "").strip()
+        msg_id = msg.get("message_id", "")
+        if text:
+            history_text += f"[ID: {msg_id}] {author}: {text}\n"
 
-    resp = requests.post(
-        f"{GIGACHAT_API_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": GIGACHAT_MODEL,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 800,
-        },
-        verify=VERIFY_SSL,
-        timeout=60,
-    )
+    user_prompt = f"""Вот последние сообщения из группового чата:
 
-    if resp.status_code == 401:
-        # Токен протух, сбрасываем кэш и пробуем ещё раз
-        print("⚠️ GigaChat токен протух, получаю новый...")
-        _token_cache["token"] = None
-        _token_cache["expires_at"] = 0
-        token = get_gigachat_token()
-        resp = requests.post(
+{history_text}
+
+Проанализируй эту беседу и реши, нужно ли тебе ответить.
+Если есть конкретный вопрос — ответь на него.
+Если это общая дискуссия — дай комментарий.
+Если участвовать нечего — верни should_reply: false.
+
+Ответь СТРОГО в формате JSON:"""
+
+    messages = [
+        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    def do_request(tok):
+        return requests.post(
             f"{GIGACHAT_API_URL}/chat/completions",
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {tok}",
                 "Content-Type": "application/json",
             },
             json={
                 "model": GIGACHAT_MODEL,
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 800,
+                "max_tokens": 1000,
             },
             verify=VERIFY_SSL,
-            timeout=60,
+            timeout=90,
         )
 
+    resp = do_request(token)
+
+    if resp.status_code == 401:
+        print("⚠️ GigaChat токен протух, получаю новый...")
+        _token_cache["token"] = None
+        _token_cache["expires_at"] = 0
+        token = get_gigachat_token()
+        resp = do_request(token)
+
     resp.raise_for_status()
-    answer = resp.json()["choices"][0]["message"]["content"].strip()
-    print(f"✅ GigaChat ответила (модель: {GIGACHAT_MODEL})")
-    return answer
+    raw_answer = resp.json()["choices"][0]["message"]["content"].strip()
+    print(f"📥 Сырой ответ GigaChat: {raw_answer[:300]}")
+
+    # Парсим JSON из ответа (может быть обёрнут в ```json ... ```)
+    json_match = re.search(r'\{[\s\S]*\}', raw_answer)
+    if not json_match:
+        print(f"❌ Не удалось найти JSON в ответе GigaChat")
+        return {"should_reply": False, "message_id": None, "answer": ""}
+
+    try:
+        result = json.loads(json_match.group(0))
+        print(f"✅ GigaChat вернула решение: should_reply={result.get('should_reply')}")
+        return result
+    except json.JSONDecodeError as e:
+        print(f"❌ Ошибка парсинга JSON: {e}")
+        return {"should_reply": False, "message_id": None, "answer": ""}
 
 
 # ==========================================
@@ -156,16 +192,10 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"marker": 0, "replied_messages": [], "history": {}}
+    return {"marker": 0, "last_analysis_time": 0}
 
 
 def save_state(state):
-    if "replied_messages" in state:
-        state["replied_messages"] = state["replied_messages"][-200:]
-    # Ограничиваем историю для каждого чата
-    if "history" in state:
-        for chat_id in list(state["history"].keys()):
-            state["history"][chat_id] = state["history"][chat_id][-20:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -183,9 +213,13 @@ def get_message_id(m: dict):
     return m.get("message_id") or body.get("mid") or m.get("mid") or m.get("id")
 
 
-def get_sender_id(m: dict):
+def get_sender_info(m: dict) -> dict:
     sender = m.get("sender") or {}
-    return sender.get("user_id")
+    return {
+        "user_id": sender.get("user_id"),
+        "name": sender.get("name") or sender.get("first_name") or "Неизвестный",
+        "is_bot": sender.get("is_bot", False)
+    }
 
 
 def get_bot_id():
@@ -200,7 +234,7 @@ def get_bot_id():
 
 
 # ==========================================
-# Отправка сообщений в MAX (с комментариями)
+# Отправка сообщений в MAX
 # ==========================================
 def send_message(chat_id, text: str, reply_to=None):
     params = {"chat_id": chat_id}
@@ -225,118 +259,101 @@ def send_message(chat_id, text: str, reply_to=None):
 
 
 # ==========================================
-# Принудительное чтение чата/канала
+# Принудительное чтение и анализ чата
 # ==========================================
-def force_read_channel(chat_id: str, state: dict):
-    print(f"🔍 Принудительное чтение чата: {chat_id}")
+def force_read_and_analyze(chat_id: str, state: dict):
+    print(f"🔍 Чтение и анализ чата: {chat_id}")
 
     bot_id = get_bot_id()
     print(f"🤖 ID бота: {bot_id}")
 
-    r = max_get("/messages", {"chat_id": chat_id, "count": 20})
+    # Получаем больше сообщений (10), чтобы после фильтрации осталось ~5
+    r = max_get("/messages", {"chat_id": chat_id, "count": 10})
     print(f"📡 GET /messages → статус {r.status_code}")
-    print(f"📄 Сырой ответ: {r.text[:1000]}")
 
     if r.status_code != 200:
-        print("❌ Не удалось прочитать историю.")
+        print(f"❌ Не удалось прочитать историю: {r.text[:500]}")
         return
 
-    messages = (r.json() or {}).get("messages") or []
-    print(f"📥 Получено сообщений: {len(messages)}")
+    messages_raw = (r.json() or {}).get("messages") or []
+    print(f"📥 Получено сообщений: {len(messages_raw)}")
 
-    replied = set(str(x) for x in state.get("replied_messages", []))
-
-    valid = []
-    for m in messages:
-        if get_sender_id(m) == bot_id:
+    # Фильтруем и готовим для анализа
+    messages_for_analysis = []
+    for m in messages_raw:
+        sender = get_sender_info(m)
+        
+        # Пропускаем сообщения от бота
+        if sender["user_id"] == bot_id or sender["is_bot"]:
             continue
+        
         text = get_text(m)
         msg_id = get_message_id(m)
+        
         if not text or not msg_id:
             continue
-        if str(msg_id) in replied:
-            continue
-        ts = m.get("timestamp") or 0
-        valid.append((ts, str(msg_id), text))
 
-    valid.sort(key=lambda x: x[0], reverse=True)
-    to_reply = valid[:3]
-    print(f"💬 Отвечаю на {len(to_reply)} сообщений")
+        messages_for_analysis.append({
+            "message_id": str(msg_id),
+            "author_name": sender["name"],
+            "text": text,
+            "timestamp": m.get("timestamp", 0)
+        })
 
-    # Получаем историю диалога для этого чата
-    chat_history_key = str(chat_id)
-    history = state.setdefault("history", {}).get(chat_history_key, [])
+    # Сортируем по времени (старые первыми, новые последними)
+    messages_for_analysis.sort(key=lambda x: x["timestamp"])
 
-    for ts, msg_id, text in reversed(to_reply):
-        print(f"Обработка: [{msg_id}] {text[:60]}...")
-        try:
-            answer = ask_gigachat(text, history=history)
-            ok = send_message(chat_id, answer, reply_to=msg_id)
-            if ok:
-                state["replied_messages"].append(msg_id)
-                # Добавляем в историю диалога
-                history.append({"role": "user", "content": text})
-                history.append({"role": "assistant", "content": answer})
-                # Ограничиваем историю 20 последними репликами (10 пар)
-                if len(history) > 20:
-                    del history[:-20]
-                state["history"][chat_history_key] = history
-                save_state(state)
-        except Exception as e:
-            print(f"Ошибка при генерации/отправке: {e}")
-        time.sleep(1.1)
+    # Берём последние 35
+    messages_for_analysis = messages_for_analysis[-35:]
+    print(f"📊 Анализирую {len(messages_for_analysis)} сообщений")
+
+    if not messages_for_analysis:
+        print("❌ Нет сообщений для анализа")
+        return
+
+    # Запрашиваем анализ у GigaChat
+    try:
+        result = ask_gigachat_analysis(messages_for_analysis)
+    except Exception as e:
+        print(f"❌ Ошибка при запросе к GigaChat: {e}")
+        return
+
+    # Проверяем, нужно ли отвечать
+    if not result.get("should_reply"):
+        print("💭 GigaChat решила не отвечать на эту беседу")
+        return
+
+    answer = result.get("answer", "").strip()
+    if not answer:
+        print("💭 GigaChat вернула пустой ответ")
+        return
+
+    # Определяем, на какое сообщение отвечать (если есть)
+    reply_to_msg_id = result.get("message_id")
+
+    # Проверяем, что message_id действительно существует в нашем списке
+    valid_msg_ids = {m["message_id"] for m in messages_for_analysis}
+    if reply_to_msg_id and reply_to_msg_id not in valid_msg_ids:
+        print(f"⚠️ message_id {reply_to_msg_id} не найден в истории, отправляю как обычный комментарий")
+        reply_to_msg_id = None
+
+    # Отправляем ответ
+    print(f"💬 Отправляю ответ (reply_to={reply_to_msg_id}): {answer[:100]}...")
+    ok = send_message(chat_id, answer, reply_to=reply_to_msg_id)
+
+    if ok:
+        # Обновляем время последнего анализа
+        state["last_analysis_time"] = time.time()
+        save_state(state)
+        print("✅ Ответ успешно отправлен")
 
 
 # ==========================================
-# Стандартный режим (через updates)
+# Стандартный режим (через updates) — отключён
 # ==========================================
 def process_updates(state: dict):
-    marker = state.get("marker", 0)
-    print(f"Запуск обработки. Текущий marker: {marker}")
-
-    r = max_get("/updates", {"marker": marker, "limit": 100})
-    if r.status_code != 200:
-        print(f"Ошибка API MAX: {r.status_code} - {r.text[:500]}")
-        return
-
-    updates = (r.json() or {}).get("updates", [])
-    if not updates:
-        print("Новых сообщений нет.")
-        return
-
-    print(f"Получено обновлений: {len(updates)}")
-    for update in updates:
-        update_id = update.get("update_id") or update.get("id")
-        message = update.get("message") or update.get("data") or {}
-        if not message:
-            if update_id: marker = max(marker, int(update_id) + 1)
-            continue
-
-        text = get_text(message)
-        recipient = message.get("recipient") or {}
-        chat_id = recipient.get("chat_id")
-        user_id = recipient.get("user_id")
-        target = chat_id or user_id
-
-        if text and target:
-            print(f"Обработка запроса: {text[:60]}...")
-            chat_history_key = str(target)
-            history = state.setdefault("history", {}).get(chat_history_key, [])
-            try:
-                answer = ask_gigachat(text, history=history)
-                send_message(target, answer)
-                history.append({"role": "user", "content": text})
-                history.append({"role": "assistant", "content": answer})
-                if len(history) > 20:
-                    del history[:-20]
-                state["history"][chat_history_key] = history
-            except Exception as e:
-                print(f"Ошибка: {e}")
-
-        if update_id:
-            marker = max(marker, int(update_id) + 1)
-
-    state["marker"] = marker
+    print("⚠️ Стандартный режим updates отключён. Используйте FORCE_CHAT_ID.")
+    # Можно оставить пустым или реализовать по аналогии
 
 
 # ==========================================
@@ -355,7 +372,7 @@ def main():
 
     try:
         if FORCE_CHAT_ID:
-            force_read_channel(FORCE_CHAT_ID, state)
+            force_read_and_analyze(FORCE_CHAT_ID, state)
         else:
             process_updates(state)
     finally:
