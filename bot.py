@@ -59,7 +59,8 @@ def load_state():
 def save_state(state):
     if "replied_messages" in state:
         state["replied_messages"] = state["replied_messages"][-200:]
-    with open(STATE_FILE, "w", encoding="8") as f:
+    # ИСПРАВЛЕНО: encoding="utf-8" вместо "8"
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
@@ -98,41 +99,44 @@ def get_bot_id():
 def ask_gigachat(prompt: str) -> str:
     """
     Отправляет запрос в GigaChat с автоматическим перебором моделей.
+    ИСПРАВЛЕНО: список messages передаётся как первый аргумент, а не через keyword.
     """
-    # Список моделей в порядке предпочтения
     models_to_try = ["GigaChat", "GigaChat-Pro", "GigaChat-Max", "GigaChat-Lite"]
-    
+
     system_prompt = (
         "Ты полезный и вежливый ассистент в чате. "
         "Отвечай кратко, по делу и на том языке, на котором к тебе обратились."
     )
-    
-    # Если пользователь хочет конкретную модель из переменной окружения
+
+    # Если пользователь указал кастомную модель через переменную окружения
     if GIGACHAT_MODEL and GIGACHAT_MODEL not in models_to_try:
         models_to_try.insert(0, GIGACHAT_MODEL)
-    
+
+    # Список сообщений, который передаём напрямую в client.chat()
+    messages_list = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
+
     for model in models_to_try:
         try:
+            # ИСПРАВЛЕНО: verify_ssl_certs=False (параметр SDK GigaChat)
             with GigaChat(
                 credentials=GIGACHAT_CREDENTIALS,
                 scope=GIGACHAT_SCOPE,
                 model=model,
-                verify_ssl=False,  # Важно для GitHub Actions (сертификаты Минцифры)
+                verify_ssl_certs=False,
             ) as client:
-                response = client.chat(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
+                # ИСПРАВЛЕНО: передаём список как первый аргумент, БЕЗ keyword messages=
+                response = client.chat(messages_list)
                 answer = response.choices[0].message.content.strip()
                 print(f"✅ GigaChat ответила через модель: {model}")
                 return answer
-                
+
         except Exception as e:
             err_str = str(e)
             print(f"⚠️ Ошибка с моделью {model}: {err_str[:200]}")
-            
+
             # Если ошибка в модели, пробуем следующую
             if "model" in err_str.lower() or "not found" in err_str.lower() or "does not exist" in err_str.lower():
                 print(f"Пробую следующую модель...")
@@ -141,15 +145,14 @@ def ask_gigachat(prompt: str) -> str:
             elif "auth" in err_str.lower() or "401" in err_str:
                 print(f"❌ Ошибка авторизации GigaChat. Проверьте GIGACHAT_CREDENTIALS.")
                 break
-            # Если таймаут или перегруз — пробуем ещё раз
+            # Если таймаут или перегруз — пробуем ещё раз с той же моделью
             elif "timeout" in err_str.lower() or "overloaded" in err_str.lower():
-                print(f"⏱️ Таймаут или перегруз, пробую снова...")
+                print(f"⏱️ Таймаут или перегруз, пробую снова через 2 сек...")
                 time.sleep(2)
                 continue
             else:
-                # Любая другая ошибка — попробуем следующую модель
                 continue
-    
+
     raise Exception("Ни одна из моделей GigaChat не сработала")
 
 
@@ -173,7 +176,7 @@ def send_message(chat_id, text: str, reply_to=None):
     if r.status_code != 200:
         print(f"❌ Ошибка отправки ({r.status_code}): {r.text[:500]}")
         return False
-    
+
     print(f"✅ Ответ отправлен (reply_to={reply_to})")
     return True
 
@@ -224,6 +227,9 @@ def force_read_channel(chat_id: str, state: dict):
             ok = send_message(chat_id, answer, reply_to=msg_id)
             if ok:
                 state["replied_messages"].append(msg_id)
+                # Сохраняем состояние сразу после успешного ответа,
+                # чтобы при падении не отвечать повторно на уже обработанное
+                save_state(state)
         except Exception as e:
             print(f"Ошибка при генерации/отправке: {e}")
         time.sleep(1.1)
@@ -281,20 +287,21 @@ def main():
     if not BOT_TOKEN:
         print("Критическая ошибка: не задан MAX_BOT_TOKEN.")
         return
-    
+
     if not GIGACHAT_CREDENTIALS:
         print("Критическая ошибка: не задан GIGACHAT_CREDENTIALS.")
         return
 
     state = load_state()
 
-    if FORCE_CHAT_ID:
-        force_read_channel(FORCE_CHAT_ID, state)
-    else:
-        process_updates(state)
-
-    save_state(state)
-    print("✅ Обработка завершена. Состояние сохранено.")
+    try:
+        if FORCE_CHAT_ID:
+            force_read_channel(FORCE_CHAT_ID, state)
+        else:
+            process_updates(state)
+    finally:
+        save_state(state)
+        print("✅ Обработка завершена. Состояние сохранено.")
 
 
 if __name__ == "__main__":
