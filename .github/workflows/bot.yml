@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0  # ВАЖНО: забираем всю историю, а не последний коммит
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,31 +37,22 @@ jobs:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: glm-4-flash
           ZAI_BASE_URL: https://api.z.ai/api/paas/v4
+          # ПРИНУДИТЕЛЬНОЕ ЧТЕНИЕ КАНАЛА
+          FORCE_CHAT_ID: -71777603207295
         run: python bot.py
 
       - name: Commit and push state changes
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          # Добавляем изменения
           git add -A 2>/dev/null || true
-          
-          # Проверяем, есть ли что коммитить
           if git diff --staged --quiet; then
             echo "Нет изменений для коммита"
             exit 0
           fi
-          
-          # Коммитим
           git commit -m "chore: update bot state marker"
-          
-          # Подтягиваем изменения из репозитория с rebase (на случай, если кто-то пушил пока мы работали)
           git pull --rebase --autostash origin main || {
-            echo "Конфликт при pull, форсируем push (state.json — это просто счётчик)"
             git push origin HEAD:main --force-with-lease
             exit 0
           }
-          
-          # Пушим
           git push
