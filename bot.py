@@ -9,7 +9,7 @@ BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 API_BASE = os.getenv("MAX_API_BASE", "https://botapi.max.ru")
 
 ZAI_API_KEY = os.getenv("ZAI_API_KEY")
-ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-5-flash") # Можно заменить на glm-4-flash или другую доступную модель
+ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4-flash") # Можно заменить на glm-4-flash или другую доступную модель
 ZAI_BASE_URL = os.getenv(
     "ZAI_BASE_URL",
     "https://api.z.ai/api/paas/v4"
