@@ -1,12 +1,11 @@
-name: MAX GigaChat Bot
+name: MAX Z.AI Bot
 
 on:
   schedule:
-    # Запуск каждые 3 минуты (синтаксис cron: минуты часы день месяц день_недели)
+    # Запуск каждые 3 минуты
     - cron: '*/3 * * * *'
-  workflow_dispatch: # Позволяет запускать вручную через вкладку Actions
+  workflow_dispatch:
 
-# Предотвращает наложение запусков, если предыдущий еще не завершился
 concurrency:
   group: max-bot-group
   cancel-in-progress: false
@@ -14,12 +13,11 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Токен для коммита изменений state.json обратно в репозиторий
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
@@ -42,7 +40,8 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add state.json
-          # Коммитим только если файл state.json реально изменился
+          # Используем -A чтобы добавить изменения, игнорируя ошибку, если файла раньше не было
+          git add -A state.json 2>/dev/null || true
+          # Коммитим только если есть изменения в индексе
           git diff --staged --quiet || git commit -m "chore: update bot state marker"
           git push
