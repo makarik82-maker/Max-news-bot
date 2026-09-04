@@ -179,13 +179,17 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"marker": 0, "last_analysis_time": 0, "processed_message_ids": []}
+    return {
+        "marker": 0,
+        "processed_message_ids": [],
+        "last_general_analysis_timestamp": 0
+    }
 
 
 def save_state(state):
-    # Ограничиваем список обработанных ID, чтобы файл не разрастался
+    # Ограничиваем список обработанных ID (последние 1000)
     if "processed_message_ids" in state:
-        state["processed_message_ids"] = state["processed_message_ids"][-500:]
+        state["processed_message_ids"] = state["processed_message_ids"][-1000:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -273,27 +277,18 @@ def is_direct_to_bot(m: dict, bot_info: dict) -> bool:
     1. Ответ на сообщение бота (reply to bot)
     2. Упоминание username бота в тексте
     """
-    bot_id = bot_info.get("user_id")
     bot_username = (bot_info.get("username") or "").lower()
     bot_name = (bot_info.get("name") or "").lower()
 
-    # 1. Ответ на сообщение бота
-    reply_mid = get_reply_to_mid(m)
-    if reply_mid:
-        # Здесь мы не знаем автора replied-сообщения без доп. запроса,
-        # но проверим ниже через сохранённый список ID сообщений бота
-        pass
-
-    # 2. Упоминание в тексте
+    # Упоминание в тексте
     text = get_text(m).lower()
     if bot_username and f"@{bot_username}" in text:
         return True
     if bot_username and bot_username in text:
         return True
 
-    # 3. Обращение по имени бота
+    # Обращение по имени бота
     if bot_name and bot_name in text and len(bot_name) > 2:
-        # Проверим, что это не часть другого слова
         pattern = rf'\b{re.escape(bot_name)}\b'
         if re.search(pattern, text):
             return True
@@ -316,8 +311,14 @@ def force_read_and_respond(chat_id: str, state: dict):
     bot_info = get_bot_info()
     print(f"🤖 Бот: id={bot_info.get('user_id')}, username={bot_info.get('username')}")
 
-    # Получаем последние 15 сообщений
-    r = max_get("/messages", {"chat_id": chat_id, "count": 15})
+    # Загружаем список уже обработанных сообщений
+    processed_ids = set(state.get("processed_message_ids", []))
+    last_analysis_time = state.get("last_general_analysis_timestamp", 0)
+    print(f"📋 Уже обработано сообщений: {len(processed_ids)}")
+    print(f"⏰ Последний общий анализ: {time.strftime('%H:%M:%S', time.localtime(last_analysis_time)) if last_analysis_time else 'никогда'}")
+
+    # Получаем последние 60 сообщений
+    r = max_get("/messages", {"chat_id": chat_id, "count": 60})
     print(f"📡 GET /messages → статус {r.status_code}")
 
     if r.status_code != 200:
@@ -326,8 +327,6 @@ def force_read_and_respond(chat_id: str, state: dict):
 
     messages_raw = (r.json() or {}).get("messages") or []
     print(f"📥 Получено сообщений: {len(messages_raw)}")
-
-    processed_ids = set(state.get("processed_message_ids", []))
 
     # Сортируем по времени (старые → новые)
     messages_raw.sort(key=lambda x: x.get("timestamp", 0))
@@ -344,16 +343,15 @@ def force_read_and_respond(chat_id: str, state: dict):
     print(f"🤖 Найдено {len(bot_message_ids)} сообщений бота в истории")
 
     # Второй проход: обрабатываем сообщения
-    # Приоритет 1: Прямые обращения к боту (упоминания + ответы на сообщения бота)
-    # Приоритет 2: Общий анализ беседы
-
-    direct_messages = []  # (message, priority)
+    direct_messages = []
     all_human_messages = []
+    new_messages_for_analysis = []  # Сообщения новее последнего анализа
 
     for m in messages_raw:
         sender = get_sender_info(m)
         msg_id = get_message_id(m)
         text = get_text(m)
+        timestamp = m.get("timestamp", 0)
 
         if not text or not msg_id:
             continue
@@ -366,16 +364,24 @@ def force_read_and_respond(chat_id: str, state: dict):
             "message_id": str(msg_id),
             "author_name": sender["name"],
             "text": text,
-            "timestamp": m.get("timestamp", 0),
+            "timestamp": timestamp,
             "is_direct": False,
             "is_reply_to_bot": False
         }
 
         all_human_messages.append(msg_data)
 
-        # Пропускаем уже обработанные сообщения (чтобы не отвечать повторно)
+        # ======= ЗАЩИТА ОТ ПОВТОРОВ =======
+        # Пропускаем уже обработанные сообщения
         if str(msg_id) in processed_ids:
             continue
+
+        # Для общего анализа: пропускаем сообщения старше последнего анализа
+        # (чтобы не анализировать одну и ту же беседу повторно)
+        if timestamp <= last_analysis_time:
+            continue
+
+        new_messages_for_analysis.append(msg_data)
 
         # Проверяем прямое обращение
         if is_direct_to_bot(m, bot_info):
@@ -388,7 +394,8 @@ def force_read_and_respond(chat_id: str, state: dict):
             msg_data["is_reply_to_bot"] = True
             direct_messages.append(msg_data)
 
-    print(f"👥 Сообщений от людей: {len(all_human_messages)}")
+    print(f"👥 Всего сообщений от людей: {len(all_human_messages)}")
+    print(f"🆕 Новых сообщений (после последнего анализа): {len(new_messages_for_analysis)}")
     print(f"🎯 Прямых обращений к боту (новых): {len(direct_messages)}")
 
     # ======= ОБРАБОТКА ПРЯМЫХ ОБРАЩЕНИЙ =======
@@ -420,7 +427,6 @@ def force_read_and_respond(chat_id: str, state: dict):
                 if not answer:
                     # Если JSON не пришёл, берём сырой текст
                     answer = raw_answer.strip()
-                    # Убираем возможные markdown-обёртки
                     answer = re.sub(r'^```(?:json)?\s*', '', answer)
                     answer = re.sub(r'\s*```$', '', answer).strip()
 
@@ -428,20 +434,21 @@ def force_read_and_respond(chat_id: str, state: dict):
                     print(f"💬 Ответ: {answer[:100]}...")
                     ok = send_message(chat_id, answer, reply_to=dm["message_id"])
                     if ok:
+                        # ======= ДОБАВЛЯЕМ В ОБРАБОТАННЫЕ =======
                         state["processed_message_ids"].append(dm["message_id"])
                         save_state(state)
-                    time.sleep(1.2)  # Лимит MAX: 2 сообщ/сек
+                    time.sleep(1.2)
                 else:
                     print("⚠️ Пустой ответ от GigaChat")
             except Exception as e:
                 print(f"❌ Ошибка обработки прямого обращения: {e}")
 
     # ======= ОБЩИЙ АНАЛИЗ БЕСЕДЫ (если не было прямых обращений) =======
-    elif all_human_messages:
-        print("\n🤔 Прямых обращений нет. Делаю общий анализ беседы...")
+    elif new_messages_for_analysis:
+        print("\n🤔 Прямых обращений нет. Делаю общий анализ новых сообщений...")
         
-        # Берём последние 35 сообщений для анализа
-        recent = all_human_messages[-35:]
+        # Берём последние 35 новых сообщений для анализа
+        recent = new_messages_for_analysis[-35:]
         history_text = ""
         for msg in recent:
             history_text += f"[ID: {msg['message_id']}] {msg['author_name']}: {msg['text']}\n"
@@ -465,17 +472,22 @@ def force_read_and_respond(chat_id: str, state: dict):
 
             if not result:
                 print("❌ Не удалось распарсить JSON из ответа GigaChat")
+                # Обновляем время анализа, чтобы не анализировать эти же сообщения повторно
+                state["last_general_analysis_timestamp"] = int(time.time() * 1000)
                 save_state(state)
                 return
 
             if not result.get("should_reply"):
                 print("💭 GigaChat решила не отвечать на эту беседу")
+                # Обновляем время анализа
+                state["last_general_analysis_timestamp"] = int(time.time() * 1000)
                 save_state(state)
                 return
 
             answer = result.get("answer", "").strip()
             if not answer:
                 print("💭 GigaChat вернула пустой ответ")
+                state["last_general_analysis_timestamp"] = int(time.time() * 1000)
                 save_state(state)
                 return
 
@@ -491,14 +503,23 @@ def force_read_and_respond(chat_id: str, state: dict):
             ok = send_message(chat_id, answer, reply_to=reply_to_msg_id)
             
             if ok:
-                state["last_analysis_time"] = time.time()
+                # ======= ОБНОВЛЯЕМ СОСТОЯНИЕ =======
+                current_time_ms = int(time.time() * 1000)
+                state["last_general_analysis_timestamp"] = current_time_ms
+                
+                # Добавляем все проанализированные сообщения в обработанные
+                # (чтобы не анализировать их повторно)
+                for msg in recent:
+                    if msg["message_id"] not in state["processed_message_ids"]:
+                        state["processed_message_ids"].append(msg["message_id"])
+                
                 save_state(state)
-                print("✅ Ответ успешно отправлен")
+                print("✅ Ответ успешно отправлен и состояние обновлено")
 
         except Exception as e:
             print(f"❌ Ошибка при общем анализе: {e}")
     else:
-        print("❌ Нет сообщений для анализа")
+        print("❌ Нет новых сообщений для анализа")
 
     save_state(state)
 
