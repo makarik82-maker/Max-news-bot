@@ -84,7 +84,7 @@ def ask_zai(prompt: str) -> str:
 
 
 # ==========================================
-# Отправка сообщений в MAX (БЕЗ Bearer!)
+# Отправка сообщений в MAX (БЕЗ Bearer, timeout 60)
 # ==========================================
 def send_message(target: dict, text: str):
     url = f"{API_BASE}/messages"
@@ -101,10 +101,12 @@ def send_message(target: dict, text: str):
             params=target,
             json={"text": text[:MAX_TEXT_LEN]},
             headers=headers,
-            timeout=30,
+            timeout=60,  # Увеличен до 60 секунд
         )
         if response.status_code != 200:
             print(f"Ошибка отправки в MAX ({response.status_code}): {response.text[:500]}")
+        else:
+            print("Сообщение успешно отправлено.")
     except Exception as e:
         print(f"Ошибка отправки в MAX: {e}")
 
@@ -131,7 +133,7 @@ def process_updates():
             f"{API_BASE}/updates",
             params={"marker": marker, "limit": 100},
             headers=headers,
-            timeout=30,
+            timeout=60,  # Увеличен до 60 секунд
         )
 
         if response.status_code != 200:
