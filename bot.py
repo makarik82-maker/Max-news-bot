@@ -13,7 +13,7 @@ BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru")
 
 ZAI_API_KEY = os.getenv("ZAI_API_KEY")
-ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4-flash")
+ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4.7-flash")  # <-- Используем GLM-4.7-Flash
 ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4")
 
 FORCE_CHAT_ID = os.getenv("FORCE_CHAT_ID")
@@ -44,7 +44,7 @@ def max_post(path, params, body):
 
 
 # ==========================================
-# Состояние
+# Работа с состоянием
 # ==========================================
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -64,7 +64,7 @@ def save_state(state):
 
 
 # ==========================================
-# Разбор сообщений
+# Разбор сообщений MAX
 # ==========================================
 def get_text(m: dict) -> str:
     body = m.get("body") or {}
@@ -93,28 +93,66 @@ def get_bot_id():
 
 
 # ==========================================
-# Z.AI
+# Z.AI API (с автоматическим подбором модели)
 # ==========================================
 def ask_zai(prompt: str) -> str:
+    """
+    Отправляет запрос в Z.AI с моделью GLM-4.7-Flash.
+    Если модель недоступна, автоматически пробует другие модели.
+    """
     url = f"{ZAI_BASE_URL.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {ZAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": ZAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "Ты полезный и вежливый ассистент в чате. Отвечай кратко, по делу и на том языке, на котором к тебе обратились."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.7,
-    }
-    response = requests.post(url, headers=headers, json=payload, timeout=60)
-    if response.status_code != 200:
-        print(f"Ошибка Z.AI API: {response.status_code} - {response.text[:500]}")
-        response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    
+    # Список моделей в порядке предпочтения
+    # GLM-4.7-Flash — основная, остальные — фолбэк
+    models_to_try = [
+        "glm-4.7-flash",      # Основная модель
+        "glm-5-flash",        # Фолбэк 1
+        "glm-5",              # Фолбэк 2
+        "glm-4-plus",         # Фолбэк 3
+        "glm-4"               # Фолбэк 4
+    ]
+    
+    for model in models_to_try:
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Ты полезный и вежливый ассистент в чате. Отвечай кратко, по делу и на том языке, на котором к тебе обратились."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code == 200:
+                print(f"✅ Z.AI ответила через модель: {model}")
+                return response.json()["choices"][0]["message"]["content"].strip()
+            
+            elif "Unknown Model" in response.text:
+                print(f"⚠️ Модель {model} недоступна, пробую следующую...")
+                continue
+            
+            else:
+                print(f"Ошибка Z.AI API с моделью {model}: {response.status_code} - {response.text[:300]}")
+                break
+                
+        except Exception as e:
+            print(f"Исключение при попытке с моделью {model}: {e}")
+            continue
+    
+    raise Exception("Ни одна из моделей Z.AI не сработала")
 
 
 # ==========================================
-# Отправка в MAX (с комментарием-ответом)
+# Отправка сообщений в MAX (с комментариями)
 # ==========================================
 def send_message(chat_id, text: str, reply_to=None):
     params = {"chat_id": chat_id}
@@ -135,6 +173,7 @@ def send_message(chat_id, text: str, reply_to=None):
     if r.status_code != 200:
         print(f"❌ Ошибка отправки ({r.status_code}): {r.text[:500]}")
         return False
+    
     print(f"✅ Ответ отправлен (reply_to={reply_to})")
     return True
 
@@ -164,20 +203,27 @@ def force_read_channel(chat_id: str, state: dict):
 
     valid = []
     for m in messages:
-        if get_sender_id(m) == bot_id:      # свои не трогаем
+        # Пропускаем сообщения от самого бота
+        if get_sender_id(m) == bot_id:
             continue
+        
         text = get_text(m)
         msg_id = get_message_id(m)
+        
         if not text or not msg_id:
             continue
-        if str(msg_id) in replied:          # уже отвечали
+        
+        # Пропускаем уже отвеченные
+        if str(msg_id) in replied:
             continue
+        
         ts = m.get("timestamp") or 0
         valid.append((ts, str(msg_id), text))
 
-    # API возвращает новые первыми; на всякий случай сортируем по времени (новые первыми)
+    # Сортируем по времени (новые первыми)
     valid.sort(key=lambda x: x[0], reverse=True)
 
+    # Берём последние 3
     to_reply = valid[:3]
     print(f"💬 Отвечаю на {len(to_reply)} сообщений")
 
@@ -191,32 +237,39 @@ def force_read_channel(chat_id: str, state: dict):
                 state["replied_messages"].append(msg_id)
         except Exception as e:
             print(f"Ошибка при генерации/отправке: {e}")
-        time.sleep(1.1)  # лимит MAX: не более 2 сообщений в секунду
+        
+        # Задержка между сообщениями (лимит MAX: 2 сообщ/сек)
+        time.sleep(1.1)
 
 
 # ==========================================
-# Стандартный режим (updates)
+# Стандартный режим (через updates)
 # ==========================================
 def process_updates(state: dict):
     marker = state.get("marker", 0)
     print(f"Запуск обработки. Текущий marker: {marker}")
 
     r = max_get("/updates", {"marker": marker, "limit": 100})
+    
     if r.status_code != 200:
         print(f"Ошибка API MAX: {r.status_code} - {r.text[:500]}")
         return
 
     updates = (r.json() or {}).get("updates", [])
+    
     if not updates:
         print("Новых сообщений нет.")
         return
 
     print(f"Получено обновлений: {len(updates)}")
+    
     for update in updates:
         update_id = update.get("update_id") or update.get("id")
         message = update.get("message") or update.get("data") or {}
+        
         if not message:
-            if update_id: marker = max(marker, int(update_id) + 1)
+            if update_id:
+                marker = max(marker, int(update_id) + 1)
             continue
 
         text = get_text(message)
@@ -240,7 +293,7 @@ def process_updates(state: dict):
 
 
 # ==========================================
-# Главная
+# Главная функция
 # ==========================================
 def main():
     if not BOT_TOKEN or not ZAI_API_KEY:
@@ -250,8 +303,10 @@ def main():
     state = load_state()
 
     if FORCE_CHAT_ID:
+        # Режим принудительного чтения канала
         force_read_channel(FORCE_CHAT_ID, state)
     else:
+        # Стандартный режим
         process_updates(state)
 
     save_state(state)
