@@ -9,14 +9,14 @@ BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 API_BASE = os.getenv("MAX_API_BASE", "https://botapi.max.ru")
 
 ZAI_API_KEY = os.getenv("ZAI_API_KEY")
-ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4-flash") # Можно заменить на glm-4-flash или другую доступную модель
+ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4-flash")
 ZAI_BASE_URL = os.getenv(
     "ZAI_BASE_URL",
     "https://api.z.ai/api/paas/v4"
 )
 
 STATE_FILE = "state.json"
-MAX_TEXT_LEN = 3900 # Максимальная длина сообщения в MAX
+MAX_TEXT_LEN = 3900
 
 
 # ==========================================
@@ -114,16 +114,20 @@ def ask_zai(prompt: str) -> str:
 
 
 # ==========================================
-# Отправка сообщений в MAX
+# Отправка сообщений в MAX (С ПОДДЕРЖКОЙ Bearer TOKEN)
 # ==========================================
 def send_message(target: dict, text: str):
-    """Отправляет сгенерированный ответ обратно в чат MAX."""
+    """Отправляет сгенерированный ответ обратно в чат MAX через Authorization header."""
     url = f"{API_BASE}/messages"
 
-    params = {
-        "access_token": BOT_TOKEN,
+    # НОВАЯ АВТОРИЗАЦИЯ ЧЕРЕЗ HEADER
+    headers = {
+        "Authorization": f"Bearer {BOT_TOKEN}",
+        "Content-Type": "application/json"
     }
-    params.update(target)
+
+    # Параметры URL теперь содержат только chat_id/user_id
+    params = target.copy() if target else {}
 
     payload = {
         "text": text[:MAX_TEXT_LEN],
@@ -134,10 +138,13 @@ def send_message(target: dict, text: str):
             url,
             params=params,
             json=payload,
+            headers=headers,
             timeout=30,
         )
         if response.status_code != 200:
             print(f"Ошибка отправки в MAX ({response.status_code}): {response.text[:500]}")
+        else:
+            print("Сообщение успешно отправлено.")
     except Exception as e:
         print(f"Ошибка отправки в MAX: {e}")
 
@@ -161,14 +168,19 @@ def process_updates():
     print(f"Запуск обработки. Текущий marker: {marker}")
 
     try:
+        # НОВАЯ АВТОРИЗАЦИЯ ЧЕРЕЗ HEADER
+        headers = {
+            "Authorization": f"Bearer {BOT_TOKEN}"
+        }
+        
         # 1. Запрашиваем новые сообщения из MAX
         response = requests.get(
             f"{API_BASE}/updates",
             params={
                 "marker": marker,
                 "limit": 100,
-                "access_token": BOT_TOKEN,
             },
+            headers=headers,
             timeout=30,
         )
 
