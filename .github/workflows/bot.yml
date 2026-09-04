@@ -2,7 +2,7 @@ name: MAX GigaChat Bot
 
 on:
   schedule:
-    - cron: '*/3 * * * *'
+    - cron: '*/2 * * * *'
   workflow_dispatch:
 
 permissions:
