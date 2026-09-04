@@ -35,11 +35,7 @@ jobs:
         env:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           MAX_API_BASE: https://platform-api2.max.ru
-          # GIGACHAT настройки
           GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-          GIGACHAT_SCOPE: GIGACHAT_API_PERS
-          GIGACHAT_MODEL: GigaChat
-          # Принудительный чат
           FORCE_CHAT_ID: -71777603207295
         run: python bot.py
 
