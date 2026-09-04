@@ -33,9 +33,9 @@ jobs:
       - name: Run Bot Script
         env:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
-          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-          # Если нужен другой URL API, раскомментируй и укажи:
-          # MAX_API_BASE: "https://api.internal.myteam.mail.ru" 
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          ZAI_MODEL: glm-4.7-flash
+          ZAI_BASE_URL: https://api.z.ai/api/paas/v4
         run: python bot.py
 
       - name: Commit state changes
