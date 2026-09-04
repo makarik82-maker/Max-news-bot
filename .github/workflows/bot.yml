@@ -1,0 +1,48 @@
+name: MAX GigaChat Bot
+
+on:
+  schedule:
+    # Запуск каждые 3 минуты (синтаксис cron: минуты часы день месяц день_недели)
+    - cron: '*/3 * * * *'
+  workflow_dispatch: # Позволяет запускать вручную через вкладку Actions
+
+# Предотвращает наложение запусков, если предыдущий еще не завершился
+concurrency:
+  group: max-bot-group
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Токен для коммита изменений state.json обратно в репозиторий
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Bot Script
+        env:
+          MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+          GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+          # Если нужен другой URL API, раскомментируй и укажи:
+          # MAX_API_BASE: "https://api.internal.myteam.mail.ru" 
+        run: python bot.py
+
+      - name: Commit state changes
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add state.json
+          # Коммитим только если файл state.json реально изменился
+          git diff --staged --quiet || git commit -m "chore: update bot state marker"
+          git push
