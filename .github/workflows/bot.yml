@@ -34,10 +34,10 @@ jobs:
       - name: Run Bot Script
         env:
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+          MAX_API_BASE: https://platform-api2.max.ru
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ZAI_MODEL: glm-4-flash
           ZAI_BASE_URL: https://api.z.ai/api/paas/v4
-          # ПРИНУДИТЕЛЬНОЕ ЧТЕНИЕ КАНАЛА
           FORCE_CHAT_ID: -71777603207295
         run: python bot.py
 
