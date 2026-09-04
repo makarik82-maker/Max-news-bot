@@ -26,6 +26,13 @@ GIGACHAT_API_URL = "https://api.giga.chat/v1"
 VERIFY_SSL = False
 GIGACHAT_MODEL = "GigaChat-3-Ultra"
 
+# Кэш OAuth-токена
+_token_cache = {"token": None, "expires_at": 0}
+
+
+# ==========================================
+# Промпты для GigaChat
+# ==========================================
 ANALYSIS_SYSTEM_PROMPT = """Ты — умный ассистент, который участвует в групповом чате.
 Тебе дают последние сообщения из чата. Твоя задача:
 
@@ -45,8 +52,15 @@ ANALYSIS_SYSTEM_PROMPT = """Ты — умный ассистент, которы
 Если не нужно отвечать вообще, верни: {"should_reply": false, "message_id": null, "answer": ""}
 """
 
-# Кэш OAuth-токена
-_token_cache = {"token": None, "expires_at": 0}
+DIRECT_QUESTION_PROMPT = """Ты — ассистент в групповом чате. К тебе обратились напрямую (упомянули или ответили на твоё сообщение).
+
+Ответь на обращение кратко, по делу и вежливо. Учитывай контекст беседы.
+
+ВАЖНО: Отвечай строго в формате JSON:
+{
+  "answer": "Твой ответ"
+}
+"""
 
 
 # ==========================================
@@ -71,7 +85,7 @@ def max_post(path, params, body):
 
 
 # ==========================================
-# GigaChat: получение OAuth-токена
+# GigaChat: OAuth-токен
 # ==========================================
 def get_gigachat_token() -> str:
     now = time.time()
@@ -103,37 +117,14 @@ def get_gigachat_token() -> str:
 
 
 # ==========================================
-# GigaChat: анализ беседы через REST API
+# GigaChat: отправка запроса
 # ==========================================
-def ask_gigachat_analysis(messages_for_analysis: list) -> dict:
-    """
-    Отправляет список сообщений в GigaChat и получает JSON-ответ.
-    Возвращает словарь: {"should_reply": bool, "message_id": str|None, "answer": str}
-    """
+def call_gigachat(system_prompt: str, user_prompt: str, max_tokens: int = 1000) -> str:
+    """Универсальный вызов GigaChat REST API."""
     token = get_gigachat_token()
 
-    # Формируем промпт с историей сообщений
-    history_text = ""
-    for msg in messages_for_analysis:
-        author = msg.get("author_name", "Неизвестный")
-        text = msg.get("text", "").strip()
-        msg_id = msg.get("message_id", "")
-        if text:
-            history_text += f"[ID: {msg_id}] {author}: {text}\n"
-
-    user_prompt = f"""Вот последние сообщения из группового чата:
-
-{history_text}
-
-Проанализируй эту беседу и реши, нужно ли тебе ответить.
-Если есть конкретный вопрос — ответь на него.
-Если это общая дискуссия — дай комментарий.
-Если участвовать нечего — верни should_reply: false.
-
-Ответь СТРОГО в формате JSON:"""
-
     messages = [
-        {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ]
 
@@ -148,7 +139,7 @@ def ask_gigachat_analysis(messages_for_analysis: list) -> dict:
                 "model": GIGACHAT_MODEL,
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 1000,
+                "max_tokens": max_tokens,
             },
             verify=VERIFY_SSL,
             timeout=90,
@@ -164,22 +155,18 @@ def ask_gigachat_analysis(messages_for_analysis: list) -> dict:
         resp = do_request(token)
 
     resp.raise_for_status()
-    raw_answer = resp.json()["choices"][0]["message"]["content"].strip()
-    print(f"📥 Сырой ответ GigaChat: {raw_answer[:300]}")
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
-    # Парсим JSON из ответа (может быть обёрнут в ```json ... ```)
-    json_match = re.search(r'\{[\s\S]*\}', raw_answer)
+
+def parse_json_response(raw: str) -> dict:
+    """Извлекает JSON из ответа GigaChat (может быть обёрнут в ```json ... ```)."""
+    json_match = re.search(r'\{[\s\S]*\}', raw)
     if not json_match:
-        print(f"❌ Не удалось найти JSON в ответе GigaChat")
-        return {"should_reply": False, "message_id": None, "answer": ""}
-
+        return {}
     try:
-        result = json.loads(json_match.group(0))
-        print(f"✅ GigaChat вернула решение: should_reply={result.get('should_reply')}")
-        return result
-    except json.JSONDecodeError as e:
-        print(f"❌ Ошибка парсинга JSON: {e}")
-        return {"should_reply": False, "message_id": None, "answer": ""}
+        return json.loads(json_match.group(0))
+    except json.JSONDecodeError:
+        return {}
 
 
 # ==========================================
@@ -192,10 +179,13 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"marker": 0, "last_analysis_time": 0}
+    return {"marker": 0, "last_analysis_time": 0, "processed_message_ids": []}
 
 
 def save_state(state):
+    # Ограничиваем список обработанных ID, чтобы файл не разрастался
+    if "processed_message_ids" in state:
+        state["processed_message_ids"] = state["processed_message_ids"][-500:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -218,19 +208,35 @@ def get_sender_info(m: dict) -> dict:
     return {
         "user_id": sender.get("user_id"),
         "name": sender.get("name") or sender.get("first_name") or "Неизвестный",
-        "is_bot": sender.get("is_bot", False)
+        "is_bot": sender.get("is_bot", False),
+        "username": sender.get("username") or ""
     }
 
 
-def get_bot_id():
+def get_reply_to_mid(m: dict):
+    """Возвращает message_id, на который это сообщение отвечает (или None)."""
+    link = m.get("link") or {}
+    if link.get("type") == "reply":
+        nested = link.get("message") or {}
+        return nested.get("mid") or nested.get("message_id")
+    return None
+
+
+def get_bot_info() -> dict:
+    """Возвращает user_id и username бота."""
     try:
         r = max_get("/me", {})
         if r.status_code == 200:
             data = r.json()
-            return data.get("user_id") or (data.get("user") or {}).get("user_id")
+            user = data.get("user") or data
+            return {
+                "user_id": user.get("user_id") or data.get("user_id"),
+                "username": user.get("username") or "",
+                "name": user.get("name") or ""
+            }
     except Exception as e:
-        print(f"Не удалось получить ID бота: {e}")
-    return None
+        print(f"Не удалось получить инфо бота: {e}")
+    return {}
 
 
 # ==========================================
@@ -259,16 +265,59 @@ def send_message(chat_id, text: str, reply_to=None):
 
 
 # ==========================================
-# Принудительное чтение и анализ чата
+# Проверка прямых обращений к боту
 # ==========================================
-def force_read_and_analyze(chat_id: str, state: dict):
-    print(f"🔍 Чтение и анализ чата: {chat_id}")
+def is_direct_to_bot(m: dict, bot_info: dict) -> bool:
+    """
+    Проверяет, является ли сообщение прямым обращением к боту:
+    1. Ответ на сообщение бота (reply to bot)
+    2. Упоминание username бота в тексте
+    """
+    bot_id = bot_info.get("user_id")
+    bot_username = (bot_info.get("username") or "").lower()
+    bot_name = (bot_info.get("name") or "").lower()
 
-    bot_id = get_bot_id()
-    print(f"🤖 ID бота: {bot_id}")
+    # 1. Ответ на сообщение бота
+    reply_mid = get_reply_to_mid(m)
+    if reply_mid:
+        # Здесь мы не знаем автора replied-сообщения без доп. запроса,
+        # но проверим ниже через сохранённый список ID сообщений бота
+        pass
 
-    # Получаем больше сообщений (10), чтобы после фильтрации осталось ~5
-    r = max_get("/messages", {"chat_id": chat_id, "count": 10})
+    # 2. Упоминание в тексте
+    text = get_text(m).lower()
+    if bot_username and f"@{bot_username}" in text:
+        return True
+    if bot_username and bot_username in text:
+        return True
+
+    # 3. Обращение по имени бота
+    if bot_name and bot_name in text and len(bot_name) > 2:
+        # Проверим, что это не часть другого слова
+        pattern = rf'\b{re.escape(bot_name)}\b'
+        if re.search(pattern, text):
+            return True
+
+    return False
+
+
+def is_reply_to_bot_message(m: dict, bot_message_ids: set) -> bool:
+    """Проверяет, является ли сообщение ответом на сообщение бота."""
+    reply_mid = get_reply_to_mid(m)
+    return bool(reply_mid and reply_mid in bot_message_ids)
+
+
+# ==========================================
+# Главная логика
+# ==========================================
+def force_read_and_respond(chat_id: str, state: dict):
+    print(f"🔍 Чтение чата: {chat_id}")
+
+    bot_info = get_bot_info()
+    print(f"🤖 Бот: id={bot_info.get('user_id')}, username={bot_info.get('username')}")
+
+    # Получаем последние 15 сообщений
+    r = max_get("/messages", {"chat_id": chat_id, "count": 15})
     print(f"📡 GET /messages → статус {r.status_code}")
 
     if r.status_code != 200:
@@ -278,82 +327,180 @@ def force_read_and_analyze(chat_id: str, state: dict):
     messages_raw = (r.json() or {}).get("messages") or []
     print(f"📥 Получено сообщений: {len(messages_raw)}")
 
-    # Фильтруем и готовим для анализа
-    messages_for_analysis = []
+    processed_ids = set(state.get("processed_message_ids", []))
+
+    # Сортируем по времени (старые → новые)
+    messages_raw.sort(key=lambda x: x.get("timestamp", 0))
+
+    # Первый проход: собираем ID сообщений самого бота
+    bot_message_ids = set()
     for m in messages_raw:
         sender = get_sender_info(m)
-        
-        # Пропускаем сообщения от бота
-        if sender["user_id"] == bot_id or sender["is_bot"]:
-            continue
-        
-        text = get_text(m)
+        if sender["user_id"] == bot_info.get("user_id") or sender["is_bot"]:
+            mid = get_message_id(m)
+            if mid:
+                bot_message_ids.add(str(mid))
+
+    print(f"🤖 Найдено {len(bot_message_ids)} сообщений бота в истории")
+
+    # Второй проход: обрабатываем сообщения
+    # Приоритет 1: Прямые обращения к боту (упоминания + ответы на сообщения бота)
+    # Приоритет 2: Общий анализ беседы
+
+    direct_messages = []  # (message, priority)
+    all_human_messages = []
+
+    for m in messages_raw:
+        sender = get_sender_info(m)
         msg_id = get_message_id(m)
-        
+        text = get_text(m)
+
         if not text or not msg_id:
             continue
 
-        messages_for_analysis.append({
+        # Пропускаем сообщения самого бота
+        if sender["user_id"] == bot_info.get("user_id") or sender["is_bot"]:
+            continue
+
+        msg_data = {
             "message_id": str(msg_id),
             "author_name": sender["name"],
             "text": text,
-            "timestamp": m.get("timestamp", 0)
-        })
+            "timestamp": m.get("timestamp", 0),
+            "is_direct": False,
+            "is_reply_to_bot": False
+        }
 
-    # Сортируем по времени (старые первыми, новые последними)
-    messages_for_analysis.sort(key=lambda x: x["timestamp"])
+        all_human_messages.append(msg_data)
 
-    # Берём последние 35
-    messages_for_analysis = messages_for_analysis[-35:]
-    print(f"📊 Анализирую {len(messages_for_analysis)} сообщений")
+        # Пропускаем уже обработанные сообщения (чтобы не отвечать повторно)
+        if str(msg_id) in processed_ids:
+            continue
 
-    if not messages_for_analysis:
+        # Проверяем прямое обращение
+        if is_direct_to_bot(m, bot_info):
+            msg_data["is_direct"] = True
+            direct_messages.append(msg_data)
+            continue
+
+        # Проверяем ответ на сообщение бота
+        if is_reply_to_bot_message(m, bot_message_ids):
+            msg_data["is_reply_to_bot"] = True
+            direct_messages.append(msg_data)
+
+    print(f"👥 Сообщений от людей: {len(all_human_messages)}")
+    print(f"🎯 Прямых обращений к боту (новых): {len(direct_messages)}")
+
+    # ======= ОБРАБОТКА ПРЯМЫХ ОБРАЩЕНИЙ =======
+    if direct_messages:
+        print(f"⚡ Обрабатываю {len(direct_messages)} прямых обращений")
+        
+        # Формируем контекст из всей истории
+        history_text = ""
+        for msg in all_human_messages[-35:]:
+            history_text += f"[ID: {msg['message_id']}] {msg['author_name']}: {msg['text']}\n"
+
+        # Отвечаем на каждое прямое обращение
+        for dm in direct_messages:
+            print(f"\n📨 Прямое обращение [{dm['message_id']}] от {dm['author_name']}: {dm['text'][:80]}...")
+
+            user_prompt = f"""Контекст последних сообщений в чате:
+{history_text}
+
+К тебе обратились напрямую:
+{dm['author_name']}: {dm['text']}
+
+Ответь кратко и по делу."""
+
+            try:
+                raw_answer = call_gigachat(DIRECT_QUESTION_PROMPT, user_prompt, max_tokens=600)
+                result = parse_json_response(raw_answer)
+                answer = result.get("answer", "").strip()
+
+                if not answer:
+                    # Если JSON не пришёл, берём сырой текст
+                    answer = raw_answer.strip()
+                    # Убираем возможные markdown-обёртки
+                    answer = re.sub(r'^```(?:json)?\s*', '', answer)
+                    answer = re.sub(r'\s*```$', '', answer).strip()
+
+                if answer:
+                    print(f"💬 Ответ: {answer[:100]}...")
+                    ok = send_message(chat_id, answer, reply_to=dm["message_id"])
+                    if ok:
+                        state["processed_message_ids"].append(dm["message_id"])
+                        save_state(state)
+                    time.sleep(1.2)  # Лимит MAX: 2 сообщ/сек
+                else:
+                    print("⚠️ Пустой ответ от GigaChat")
+            except Exception as e:
+                print(f"❌ Ошибка обработки прямого обращения: {e}")
+
+    # ======= ОБЩИЙ АНАЛИЗ БЕСЕДЫ (если не было прямых обращений) =======
+    elif all_human_messages:
+        print("\n🤔 Прямых обращений нет. Делаю общий анализ беседы...")
+        
+        # Берём последние 35 сообщений для анализа
+        recent = all_human_messages[-35:]
+        history_text = ""
+        for msg in recent:
+            history_text += f"[ID: {msg['message_id']}] {msg['author_name']}: {msg['text']}\n"
+
+        user_prompt = f"""Вот последние сообщения из группового чата:
+
+{history_text}
+
+Проанализируй эту беседу и реши, нужно ли тебе ответить.
+Если есть конкретный вопрос — ответь на него (укажи message_id).
+Если это общая дискуссия — дай комментарий.
+Если участвовать нечего — верни should_reply: false.
+
+Ответь СТРОГО в формате JSON:"""
+
+        try:
+            raw_answer = call_gigachat(ANALYSIS_SYSTEM_PROMPT, user_prompt, max_tokens=1000)
+            print(f"📥 Сырой ответ GigaChat: {raw_answer[:300]}")
+            
+            result = parse_json_response(raw_answer)
+
+            if not result:
+                print("❌ Не удалось распарсить JSON из ответа GigaChat")
+                save_state(state)
+                return
+
+            if not result.get("should_reply"):
+                print("💭 GigaChat решила не отвечать на эту беседу")
+                save_state(state)
+                return
+
+            answer = result.get("answer", "").strip()
+            if not answer:
+                print("💭 GigaChat вернула пустой ответ")
+                save_state(state)
+                return
+
+            reply_to_msg_id = result.get("message_id")
+
+            # Проверяем, что message_id существует в нашем списке
+            valid_msg_ids = {m["message_id"] for m in recent}
+            if reply_to_msg_id and reply_to_msg_id not in valid_msg_ids:
+                print(f"⚠️ message_id {reply_to_msg_id} не найден, отправляю как обычный комментарий")
+                reply_to_msg_id = None
+
+            print(f"💬 Отправляю ответ (reply_to={reply_to_msg_id}): {answer[:100]}...")
+            ok = send_message(chat_id, answer, reply_to=reply_to_msg_id)
+            
+            if ok:
+                state["last_analysis_time"] = time.time()
+                save_state(state)
+                print("✅ Ответ успешно отправлен")
+
+        except Exception as e:
+            print(f"❌ Ошибка при общем анализе: {e}")
+    else:
         print("❌ Нет сообщений для анализа")
-        return
 
-    # Запрашиваем анализ у GigaChat
-    try:
-        result = ask_gigachat_analysis(messages_for_analysis)
-    except Exception as e:
-        print(f"❌ Ошибка при запросе к GigaChat: {e}")
-        return
-
-    # Проверяем, нужно ли отвечать
-    if not result.get("should_reply"):
-        print("💭 GigaChat решила не отвечать на эту беседу")
-        return
-
-    answer = result.get("answer", "").strip()
-    if not answer:
-        print("💭 GigaChat вернула пустой ответ")
-        return
-
-    # Определяем, на какое сообщение отвечать (если есть)
-    reply_to_msg_id = result.get("message_id")
-
-    # Проверяем, что message_id действительно существует в нашем списке
-    valid_msg_ids = {m["message_id"] for m in messages_for_analysis}
-    if reply_to_msg_id and reply_to_msg_id not in valid_msg_ids:
-        print(f"⚠️ message_id {reply_to_msg_id} не найден в истории, отправляю как обычный комментарий")
-        reply_to_msg_id = None
-
-    # Отправляем ответ
-    print(f"💬 Отправляю ответ (reply_to={reply_to_msg_id}): {answer[:100]}...")
-    ok = send_message(chat_id, answer, reply_to=reply_to_msg_id)
-
-    if ok:
-        # Обновляем время последнего анализа
-        state["last_analysis_time"] = time.time()
-        save_state(state)
-        print("✅ Ответ успешно отправлен")
-
-
-# ==========================================
-# Стандартный режим (через updates) — отключён
-# ==========================================
-def process_updates(state: dict):
-    print("⚠️ Стандартный режим updates отключён. Используйте FORCE_CHAT_ID.")
-    # Можно оставить пустым или реализовать по аналогии
+    save_state(state)
 
 
 # ==========================================
@@ -372,9 +519,9 @@ def main():
 
     try:
         if FORCE_CHAT_ID:
-            force_read_and_analyze(FORCE_CHAT_ID, state)
+            force_read_and_respond(FORCE_CHAT_ID, state)
         else:
-            process_updates(state)
+            print("⚠️ FORCE_CHAT_ID не задан")
     finally:
         save_state(state)
         print("✅ Обработка завершена. Состояние сохранено.")
